@@ -58,8 +58,11 @@
 
 <?php
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && !empty($_POST['file_url'])) {
+    ini_set('display_errors', 1);
+    ini_set('display_startup_errors', 1);
+    error_reporting(E_ALL);
     ini_set('max_execution_time', 0);  // Unlimited execution time
-    ini_set('memory_limit', '2G');  // Increase memory limit to avoid running out of memory
+    ini_set('memory_limit', '1024M');  // Set memory limit to 1024MB
 
     /* Get the URL from the form */
     $remote_file_url = filter_var(trim($_POST['file_url']), FILTER_SANITIZE_URL);
@@ -70,6 +73,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !empty($_POST['file_url'])) {
     } else {
         /* Extract file name from the URL */
         $local_file = basename($remote_file_url);
+
+        /* Ensure directory is writable */
+        if (!is_writable(dirname(__FILE__))) {
+            die("Directory is not writable.");
+        }
 
         /* Check if file already exists and get its size for resuming */
         $local_file_size = 0;
@@ -89,45 +97,46 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !empty($_POST['file_url'])) {
 
         /* Set cURL options */
         curl_setopt($ch, CURLOPT_URL, $remote_file_url);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);  // Return the transfer as a string
-        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);  // Follow redirects
-        curl_setopt($ch, CURLOPT_BUFFERSIZE, 1024 * 1024); // Buffer size to 1MB
+        curl_setopt($ch, CURLOPT_FILE, $fp);
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 0);  // Keep alive, no timeout
+        curl_setopt($ch, CURLOPT_BUFFERSIZE, 128 * 1024); // Set buffer size for download (128KB)
+        curl_setopt($ch, CURLOPT_NOPROGRESS, false); // Enable progress callback
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
 
         /* Set the Range header if the file already exists */
         if ($local_file_size > 0) {
             curl_setopt($ch, CURLOPT_RANGE, $local_file_size . '-');
         }
 
-        /* Execute the cURL session */
-        $file_data = curl_exec($ch);
+        /* Progress bar callback function */
+        curl_setopt($ch, CURLOPT_PROGRESSFUNCTION, function($resource, $download_size, $downloaded, $upload_size, $uploaded) use ($local_file_size) {
+            if ($download_size > 0) {
+                // Add previously downloaded size if resuming
+                $downloaded += $local_file_size;
+                $total_size = $download_size + $local_file_size;
 
-        if (curl_errno($ch)) {
-            echo "<script>document.getElementById('message').innerText = 'Error: " . curl_error($ch) . "';</script>";
-        } else {
-            /* Check the Content-Length header to determine the total file size */
-            $total_size = curl_getinfo($ch, CURLINFO_CONTENT_LENGTH_DOWNLOAD) + $local_file_size;
+                // Calculate percentage of progress
+                $progress = ($downloaded / $total_size) * 100;
 
-            /* Write the file in chunks */
-            $chunk_size = 1024 * 1024; // 1MB chunk size
-            $bytes_written = 0;
-
-            while ($bytes_written < strlen($file_data)) {
-                $chunk = substr($file_data, $bytes_written, $chunk_size);
-                fwrite($fp, $chunk);
-                $bytes_written += $chunk_size;
-
-                /* Calculate the progress */
-                $progress = (($bytes_written + $local_file_size) / $total_size) * 100;
-
-                /* Update progress bar */
+                // Update the progress bar through JavaScript
                 echo "<script>
                     document.getElementById('progress-bar').style.width = '$progress%';
                     document.getElementById('progress-bar').innerText = '" . round($progress, 2) . "%';
                     document.getElementById('message').innerText = 'Downloading...';
                     </script>";
-                flush();
+                flush(); // Ensure output is sent immediately
             }
+        });
+        curl_setopt($ch, CURLOPT_NOPROGRESS, false);  // Required for CURLOPT_PROGRESSFUNCTION to work
 
+        /* Execute cURL request */
+        $result = curl_exec($ch);
+
+        /* Check if any error occurred */
+        if (curl_errno($ch)) {
+            echo "<script>document.getElementById('message').innerText = 'Error: " . curl_error($ch) . "';</script>";
+        } else {
             echo "<script>document.getElementById('message').innerText = 'Download completed successfully!';</script>";
         }
 
