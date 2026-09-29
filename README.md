@@ -31,7 +31,17 @@ To use this downloader, follow these steps:
 1. Open the application in a web browser.
 2. Enter the URL of the file you wish to download in the input field.
 3. Click on "Download" to start downloading the file.
-4. The progress bar will show the download status, and the file will be saved on the server.
+4. The progress bar will show the download status, and the file will be saved into the server's `downloads/` directory.
+
+## Security
+
+Because this tool fetches a URL supplied by the user, it is hardened against the two classic risks of server-side downloaders:
+
+- **SSRF protection.** Only `http://` and `https://` URLs are accepted (no `file://`, `ftp://`, `gopher://`, ...), for both the initial request and any redirects. The target host is resolved first and rejected if it points at a private, loopback, link-local or reserved IP address, so the server cannot be tricked into reaching internal services or cloud metadata endpoints (e.g. `169.254.169.254`).
+- **No remote code execution.** Downloads are written into a dedicated `downloads/` directory — never the web root — and filenames are sanitized. Extensions a web server might execute (`.php`, `.phtml`, `.cgi`, ...) are neutralized, so a downloaded file can never become executable code on the host.
+- Errors are logged, not printed, so server paths are not leaked to visitors.
+
+> Deploy this behind authentication. Even with the safeguards above, an open downloader lets anyone use your server's bandwidth and disk.
 
 ## Requirements
 
