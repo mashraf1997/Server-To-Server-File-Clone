@@ -57,90 +57,165 @@
 <div id="message" class="message"></div>
 
 <?php
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && !empty($_POST['file_url'])) {
-    ini_set('display_errors', 1);
-    ini_set('display_startup_errors', 1);
-    error_reporting(E_ALL);
-    ini_set('max_execution_time', 0);  // Unlimited execution time
-    ini_set('memory_limit', '1024M');  // Set memory limit to 1024MB
+/*
+ * Security model for a server-side downloader
+ * -------------------------------------------
+ * A tool that fetches a user-supplied URL is a classic SSRF and RCE risk.
+ * The defenses below are deliberate; do not remove them:
+ *
+ *  1. Only http/https are allowed (no file://, gopher://, ftp://, ...),
+ *     for the initial request AND for redirects.
+ *  2. The target host is resolved and rejected if it points at a private,
+ *     loopback, link-local or otherwise reserved IP address, so the server
+ *     cannot be tricked into fetching internal services or cloud metadata
+ *     (e.g. 169.254.169.254).
+ *  3. Downloads are written into a dedicated ./downloads directory, never
+ *     the web root, and the filename is sanitized. Extensions that a web
+ *     server might execute (php, phtml, cgi, ...) are neutralized so a
+ *     downloaded file can never become executable code on this host.
+ *  4. Errors are logged, not printed, so internal paths don't leak.
+ */
 
-    /* Get the URL from the form */
+/** Reject URLs whose host resolves to a non-public IP address (SSRF guard). */
+function host_is_public($host)
+{
+    $ips = array();
+    $records = @dns_get_record($host, DNS_A + DNS_AAAA);
+    if ($records) {
+        foreach ($records as $r) {
+            if (isset($r['ip'])) { $ips[] = $r['ip']; }
+            if (isset($r['ipv6'])) { $ips[] = $r['ipv6']; }
+        }
+    }
+    // Also handle the case where the host is already a literal IP.
+    if (filter_var($host, FILTER_VALIDATE_IP)) {
+        $ips[] = $host;
+    }
+    if (empty($ips)) {
+        return false; // cannot resolve -> refuse
+    }
+    foreach ($ips as $ip) {
+        // NO_PRIV_RANGE and NO_RES_RANGE reject 10/8, 172.16/12, 192.168/16,
+        // 127/8, 169.254/16, ::1, fc00::/7, etc.
+        if (!filter_var(
+            $ip,
+            FILTER_VALIDATE_IP,
+            FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE
+        )) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/** Turn a remote URL into a safe local filename inside the downloads dir. */
+function safe_local_name($url)
+{
+    $name = basename((string) parse_url($url, PHP_URL_PATH));
+    $name = preg_replace('/[^A-Za-z0-9._-]/', '_', (string) $name);
+    $name = ltrim($name, '.');                 // no leading dots / hidden files
+    if ($name === '') {
+        $name = 'download-' . date('Ymd-His');
+    }
+    // Neutralize extensions the web server might execute.
+    $dangerous = array('php', 'php3', 'php4', 'php5', 'php7', 'phtml', 'phar',
+                       'pht', 'cgi', 'pl', 'py', 'sh', 'htaccess');
+    $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
+    if (in_array($ext, $dangerous, true)) {
+        $name .= '.txt';
+    }
+    return $name;
+}
+
+function fail($message)
+{
+    echo "<script>document.getElementById('message').innerText = "
+        . json_encode($message) . ";</script>";
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && !empty($_POST['file_url'])) {
+    // Log errors instead of displaying them (avoid leaking server paths).
+    ini_set('display_errors', 0);
+    ini_set('log_errors', 1);
+    error_reporting(E_ALL);
+    ini_set('max_execution_time', 0);
+    ini_set('memory_limit', '1024M');
+
     $remote_file_url = filter_var(trim($_POST['file_url']), FILTER_SANITIZE_URL);
 
-    /* Validate the URL */
-    if (!filter_var($remote_file_url, FILTER_VALIDATE_URL)) {
-        echo "<script>document.getElementById('message').innerText = 'Invalid URL!';</script>";
+    $scheme = strtolower((string) parse_url($remote_file_url, PHP_URL_SCHEME));
+    $host   = parse_url($remote_file_url, PHP_URL_HOST);
+
+    if (!filter_var($remote_file_url, FILTER_VALIDATE_URL) ||
+        !in_array($scheme, array('http', 'https'), true) ||
+        !$host) {
+        fail('Invalid URL. Only http:// and https:// links are allowed.');
+    } elseif (!host_is_public($host)) {
+        fail('This host is not allowed.');
     } else {
-        /* Extract file name from the URL */
-        $local_file = basename($remote_file_url);
-
-        /* Ensure directory is writable */
-        if (!is_writable(dirname(__FILE__))) {
-            die("Directory is not writable.");
+        // Store downloads outside the web root's script directory.
+        $download_dir = __DIR__ . DIRECTORY_SEPARATOR . 'downloads';
+        if (!is_dir($download_dir) && !mkdir($download_dir, 0755, true) && !is_dir($download_dir)) {
+            die('Could not create the downloads directory.');
+        }
+        if (!is_writable($download_dir)) {
+            die('The downloads directory is not writable.');
         }
 
-        /* Check if file already exists and get its size for resuming */
-        $local_file_size = 0;
-        if (file_exists($local_file)) {
-            $local_file_size = filesize($local_file);
-        }
+        $local_file = $download_dir . DIRECTORY_SEPARATOR . safe_local_name($remote_file_url);
 
-        /* Open file in append mode if it exists, or create it if not */
-        $fp = fopen($local_file, 'a+'); // Open in append mode to resume
+        // Resume support: continue from the size already on disk.
+        $local_file_size = file_exists($local_file) ? filesize($local_file) : 0;
 
+        $fp = fopen($local_file, 'a+');
         if (!$fp) {
-            die("Failed to open local file for writing.");
+            die('Failed to open local file for writing.');
         }
 
-        /* Initialize cURL */
         $ch = curl_init();
-
-        /* Set cURL options */
         curl_setopt($ch, CURLOPT_URL, $remote_file_url);
         curl_setopt($ch, CURLOPT_FILE, $fp);
         curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-        curl_setopt($ch, CURLOPT_TIMEOUT, 0);  // Keep alive, no timeout
-        curl_setopt($ch, CURLOPT_BUFFERSIZE, 128 * 1024); // Set buffer size for download (128KB)
-        curl_setopt($ch, CURLOPT_NOPROGRESS, false); // Enable progress callback
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_MAXREDIRS, 5);
+        // Restrict protocols for both the request and any redirects.
+        if (defined('CURLPROTO_HTTP')) {
+            curl_setopt($ch, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+            curl_setopt($ch, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+        }
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 30);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 0);      // no total timeout (large files)
+        curl_setopt($ch, CURLOPT_BUFFERSIZE, 128 * 1024);
+        curl_setopt($ch, CURLOPT_NOPROGRESS, false);
 
-        /* Set the Range header if the file already exists */
         if ($local_file_size > 0) {
             curl_setopt($ch, CURLOPT_RANGE, $local_file_size . '-');
         }
 
-        /* Progress bar callback function */
-        curl_setopt($ch, CURLOPT_PROGRESSFUNCTION, function($resource, $download_size, $downloaded, $upload_size, $uploaded) use ($local_file_size) {
-            if ($download_size > 0) {
-                // Add previously downloaded size if resuming
-                $downloaded += $local_file_size;
-                $total_size = $download_size + $local_file_size;
-
-                // Calculate percentage of progress
-                $progress = ($downloaded / $total_size) * 100;
-
-                // Update the progress bar through JavaScript
-                echo "<script>
-                    document.getElementById('progress-bar').style.width = '$progress%';
-                    document.getElementById('progress-bar').innerText = '" . round($progress, 2) . "%';
-                    document.getElementById('message').innerText = 'Downloading...';
-                    </script>";
-                flush(); // Ensure output is sent immediately
+        curl_setopt($ch, CURLOPT_PROGRESSFUNCTION,
+            function ($resource, $download_size, $downloaded) use ($local_file_size) {
+                if ($download_size > 0) {
+                    $downloaded += $local_file_size;
+                    $total_size = $download_size + $local_file_size;
+                    $progress = ($downloaded / $total_size) * 100;
+                    echo "<script>
+                        document.getElementById('progress-bar').style.width = '" . (float) $progress . "%';
+                        document.getElementById('progress-bar').innerText = '" . round($progress, 2) . "%';
+                        document.getElementById('message').innerText = 'Downloading...';
+                        </script>";
+                    flush();
+                }
             }
-        });
-        curl_setopt($ch, CURLOPT_NOPROGRESS, false);  // Required for CURLOPT_PROGRESSFUNCTION to work
+        );
 
-        /* Execute cURL request */
-        $result = curl_exec($ch);
+        curl_exec($ch);
 
-        /* Check if any error occurred */
         if (curl_errno($ch)) {
-            echo "<script>document.getElementById('message').innerText = 'Error: " . curl_error($ch) . "';</script>";
+            error_log('Downloader cURL error: ' . curl_error($ch));
+            fail('Download failed. Please check the URL and try again.');
         } else {
-            echo "<script>document.getElementById('message').innerText = 'Download completed successfully!';</script>";
+            fail('Download completed successfully!');
         }
 
-        /* Close cURL and file handler */
         curl_close($ch);
         fclose($fp);
     }
